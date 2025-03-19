@@ -1,139 +1,170 @@
-import asyncio
-import logging
-import asyncpg
-import csv
 import os
-import aiofiles
-import uvloop
-from io import StringIO
-from datetime import datetime
-
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+import logging
+import pandas as pd
+import asyncpg
+import nest_asyncio
+from dotenv import load_dotenv
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, InputFile
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, CallbackQueryHandler,
-    ConversationHandler, MessageHandler, filters, ContextTypes
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+    ConversationHandler,
 )
-from config import TOKEN, DATABASE_URL
 
-# Администраторы
-ADMIN_IDS = {5060645464}  # Используем set для быстрого поиска
+# Применяем nest_asyncio для предотвращения проблем с event loop
+nest_asyncio.apply()
 
 # Настройка логирования
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
-logger = logging.getLogger(__name__)
 
-# Состояния ConversationHandler
-WAITING_VIDEO_LINKS, CONFIRM_MORE_LINKS = range(30, 32)
-WAITING_SCORE, WAITING_COMMENT = range(2)
+# Загрузка переменных окружения
+load_dotenv()
+TOKEN = os.getenv("TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+# Проверка токена
+if not TOKEN:
+    logging.error("Токен бота отсутствует. Проверьте .env файл.")
+    raise ValueError("Токен не найден")
+
+# Определение состояний
+WAITING_VIDEO_LINKS, WAITING_RATING, WAITING_COMMENT = range(3)
 
 # Подключение к БД
-async def connect_with_retry(retries=5, delay=3):
-    for i in range(retries):
-        try:
-            pool = await asyncpg.create_pool(DATABASE_URL, max_size=20)
-            logger.info("✅ Подключение к PostgreSQL успешно установлено.")
-            return pool
-        except Exception as e:
-            logger.warning(f"⚠️ Не удалось подключиться к PostgreSQL: {e}. Попытка {i+1}/{retries}")
-            await asyncio.sleep(delay)
-    raise Exception("❌ Не удалось подключиться к PostgreSQL после нескольких попыток.")
+async def get_db_pool():
+    return await asyncpg.create_pool(DATABASE_URL)
 
-# Функции БД
-async def add_video_link(pool, video_link: str):
-    async with pool.acquire() as conn:
-        try:
-            await conn.execute('''
-                INSERT INTO videos (video_link) VALUES ($1)
-                ON CONFLICT (video_link) DO NOTHING;
-            ''', video_link)
-            logger.info("✅ Добавлено новое видео: %s", video_link)
-        except Exception as e:
-            logger.error(f"❌ Ошибка добавления видео {video_link}: {e}")
-
-# Команда /start
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("🎥 Отправить видео", callback_data='send_video')],
-        [InlineKeyboardButton("⭐ Начать оценку", callback_data='start_rating')],
-        [InlineKeyboardButton("❓ Помощь", callback_data='help')]
-    ]
-    markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("Привет! Выберите действие:", reply_markup=markup)
-
-# Обработчик нажатий кнопок
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    try:
-        if query.data == "send_video":
-            await query.message.reply_text("Отправьте ссылку на видео.")
-        elif query.data == "start_rating":
-            await query.message.reply_text("Оцените видео.")
-        elif query.data == "help":
-            await query.message.reply_text("Справка по боту.")
-        else:
-            logger.warning(f"⚠️ Неизвестный callback_data: {query.data}")
-    except Exception as e:
-        logger.error(f"❌ Ошибка при обработке callback: {e}")
-
-# Команда /download – скачивание CSV
-async def download_table(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    if user_id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ У вас нет прав для скачивания таблицы.")
+# Пересоздание таблицы
+async def recreate_table(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db_pool = context.bot_data.get("db_pool")
+    if not db_pool:
+        await update.effective_message.reply_text("❌ База данных недоступна")
         return
 
-    pool = context.bot_data["db_pool"]
-    filename = "videos_ratings.csv"
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT * FROM videos")
+    async with db_pool.acquire() as conn:
+        await conn.execute("DROP TABLE IF EXISTS videos CASCADE")
+        await conn.execute(
+            """CREATE TABLE videos (
+                id SERIAL PRIMARY KEY,
+                link TEXT NOT NULL,
+                total_score INT DEFAULT 0,
+                avg_score FLOAT DEFAULT 0,
+                comments TEXT DEFAULT '[]'
+            )"""
+        )
+    await update.effective_message.reply_text("🔄 Таблица пересоздана")
 
-    output = StringIO()
-    writer = csv.writer(output, delimiter=';')
-    writer.writerow(["ID", "Ссылка", "Дата создания"])
-    for row in rows:
-        writer.writerow([row['video_id'], row['video_link'], row['created_at']])
+# Скачивание данных
+async def download(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db_pool = context.bot_data.get("db_pool")
+    if not db_pool:
+        await update.effective_message.reply_text("❌ База данных недоступна")
+        return
 
-    async with aiofiles.open(filename, "w", encoding="utf-8-sig") as f:
-        await f.write(output.getvalue())
+    async with db_pool.acquire() as conn:
+        records = await conn.fetch("SELECT * FROM videos")
+        df = pd.DataFrame(records, columns=["id", "link", "total_score", "avg_score", "comments"])
+        df.to_csv("videos.csv", index=False)
+        
+        with open("videos.csv", "rb") as file:
+            await update.effective_message.reply_document(document=InputFile(file, "videos.csv"))
+
+# Обработчики команд
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("🎥 Отправить видео", callback_data="send_video")],
+        [InlineKeyboardButton("⭐ Начать оценку", callback_data="start_rating")],
+        [InlineKeyboardButton("ℹ️ Помощь", callback_data="help")],
+    ]
+    await update.effective_message.reply_text(
+        "Привет! Выберите действие:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    help_text = """
+    🆘 Команды:
+    /start - Главное меню
+    /download - Экспорт данных
+    /recreate_table - Сброс базы данных
+    """
+    await update.effective_message.reply_text(help_text)
+
+# Отправка видео
+async def send_video_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    await update.effective_message.reply_text("📤 Отправьте ссылки через пробел:")
+    return WAITING_VIDEO_LINKS
+
+async def receive_video_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        await update.effective_message.reply_text("❌ Некорректный ввод")
+        return ConversationHandler.END
+
+    links = update.message.text.split()
+    db_pool = context.bot_data.get("db_pool")
+    
+    if not db_pool:
+        await update.effective_message.reply_text("❌ Ошибка базы данных")
+        return ConversationHandler.END
 
     try:
-        async with aiofiles.open(filename, "rb") as f:
-            await update.message.reply_document(document=f, filename=filename)
+        async with db_pool.acquire() as conn:
+            for link in links:
+                await conn.execute(
+                    "INSERT INTO videos (link) VALUES ($1)", link.strip()
+                )
+        
+        keyboard = [
+            [InlineKeyboardButton("➕ Ещё видео", callback_data="send_video")],
+            [InlineKeyboardButton("🏠 В меню", callback_data="start")],
+        ]
+        await update.effective_message.reply_text(
+            "✅ Ссылки сохранены!",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
     except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка при отправке файла: {e}")
-    os.remove(filename)
+        logging.error(f"Ошибка: {e}")
+        await update.effective_message.reply_text("🚫 Произошла ошибка")
 
-# Обновление хендлеров
-async def main():
-    try:
-        pool = await connect_with_retry()
-        app = ApplicationBuilder().token(TOKEN).build()
-        app.bot_data["db_pool"] = pool
+    return ConversationHandler.END
 
-        app.add_handler(CommandHandler("start", start))
-        app.add_handler(CallbackQueryHandler(button_handler))
-        app.add_handler(CommandHandler("download", download_table))
-        app.add_handler(CommandHandler("clear_table", clear_table))
+# Настройка приложения
+def main():
+    app = Application.builder().token(TOKEN).build()
 
-        logger.info("✅ Бот успешно запущен!")
-        await app.run_polling(allowed_updates=Update.ALL_TYPES, close_loop=False)
-    except Exception as e:
-        logger.error(f"❌ Ошибка запуска бота: {e}")
+    # Conversation Handler для отправки видео
+    conv_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(send_video_callback, pattern="^send_video$")],
+        states={
+            WAITING_VIDEO_LINKS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_video_links)
+            ],
+        },
+        fallbacks=[],
+    )
+
+    # Регистрация обработчиков
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("download", download))
+    app.add_handler(CommandHandler("recreate_table", recreate_table))
+    app.add_handler(conv_handler)
+    app.add_handler(CallbackQueryHandler(start, pattern="^start$"))
+    app.add_handler(CallbackQueryHandler(help_command, pattern="^help$"))
+
+    # Запуск бота
+    async def on_startup(app: Application):
+        app.bot_data["db_pool"] = await get_db_pool()
+        logging.info("Бот запущен")
+
+    app.run_polling(on_startup=on_startup)
 
 if __name__ == "__main__":
-    uvloop.install()
-    
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    
-    loop.create_task(main())
-    loop.run_forever()
-
+    main()
