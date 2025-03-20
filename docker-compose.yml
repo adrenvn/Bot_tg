@@ -28,10 +28,21 @@ services:
     networks:
       - bot-network
     restart: unless-stopped
-    command: ["sh", "-c", "sleep 5 && python bot_pg.py"]
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    command: 
+      - sh
+      - -c
+      - |
+        apt-get update && apt-get install -y postgresql-client && 
+        while ! pg_isready -h db -U botuser -d botdb; do sleep 2; done && 
+        sleep 5 && 
+        python bot_pg.py
 
 volumes:
   db_data: {}
 
 networks:
-  bot-network: {}
+  bot-network:
+    driver: bridge
